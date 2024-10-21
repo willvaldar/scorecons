@@ -15,6 +15,6 @@ To run the program:
    
 2. Run
    
-`perl -w -I<pathto_include_directory> scorecons <filename>`
+`perl -w -I<include_dir> scorecons <filename>`
    
-An example fasta file is provided.
+where <include_dir> is the path to the include/ directory in the repo. An example fasta file for <filename> is provided in the repo as `hb_aln.fa`.
