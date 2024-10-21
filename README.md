@@ -11,10 +11,10 @@ This repo provides the original perl program behind that web server.
 To run the program:
 1. Set the environmental variable SCORECONS_MATRICES to the matrix/ directory. Eg, in bash
 
-`code` export SCORECONS_MATRICES "/usr/myname/otherthings/scorecons/matrix/"
+`export SCORECONS_MATRICES "/usr/myname/otherthings/scorecons/matrix/"`
    
 2. Run
    
-`code`   perl -w -I<pathto_include_directory> scorecons <filename>
+`perl -w -I<pathto_include_directory> scorecons <filename>`
    
 An example fasta file is provided.
