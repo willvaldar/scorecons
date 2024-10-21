@@ -1,0 +1,327 @@
+#!/usr/local/bin/perl -w 
+use strict;
+use StdDefs;
+use Assert;
+use English;
+use Getopt::Long;
+use CSequence;
+use CSequenceReader;
+use CAlignment;
+use CMdm;
+use NormalizeMdm;
+use MsaCon::CEntropyNorm7Scorer;
+use MsaCon::CEntropyNorm21Scorer;
+use MsaCon::CEntropyScorer;
+use MsaCon::CBasicMdmScorer;
+use MsaCon::CValdar01Scorer;
+use MsaCon::CTridentScorer;
+use MsaCon::Utils qw(Dops);
+use VUtils::DataManip qw(ElementFranks);
+use FileIoHelper qw(OpenFilesForReading OpenFilesForWriting GetStdOut
+        println);
+use Env;
+
+use constant NO_FOCUS => -1;
+
+my $DEFAULT_GAP_PHILIA        = 0;
+my $DEFAULT_MATRIX_NORM       = 'linear';
+my $DEFAULT_METHOD            = 'valdar01';
+my $DEFAULT_TRIDENT_DIVERSITY = 1;
+my $DEFAULT_TRIDENT_CHEMISTRY = 1;
+my $DEFAULT_TRIDENT_GAPS      = 1;
+my $NO_FOCUS_CHAR             = '#';
+
+# matrices
+
+my $MATRIX_DIR = $ENV{SCORECONS_MATRICES};
+my %hMatrixFiles = (
+        'blosum45'  => "$MATRIX_DIR/BLOSUM45.mat",
+        'blosum62'  => "$MATRIX_DIR/BLOSUM62.mat",
+        'blosum80'  => "$MATRIX_DIR/BLOSUM80.mat",
+        'pam30'     => "$MATRIX_DIR/PAM30.mat",
+        'pam70'     => "$MATRIX_DIR/PAM70.mat",
+        'pet91mod'  => "$MATRIX_DIR/PET91mod.mat",
+        );
+my $DEFAULT_MATRIX = 'pet91mod';
+
+# switches
+my $ostDops      = null;
+my $isCalcFranks = false;
+
+# main program
+
+Run();
+
+# functions
+
+sub Run()
+{
+    my($aln, $focus, $scorer, $ostCons) = ParseCommandLine();
+    
+    my($aScores, $aSeqRes, $aAlnCols) = ScoreAln($aln, $focus, $scorer);
+    
+    if ($isCalcFranks)
+    {
+        $aScores = ElementFranks($aScores, [sort{$a<=>$b}@$aScores]);
+    }
+    
+    SaveScores($ostCons, $aScores, $aSeqRes, $aAlnCols);
+    
+    if ($ostDops)
+    {
+        println($ostDops, 100*Dops($aScores));
+    }
+}
+
+sub ScoreAln($$$)
+{
+    my($aln, $focus, $scorer) = @ARG;
+    
+    $scorer->setAln($aln);
+
+    # collect scores from the alignment
+    my $aScores  = [];
+    my $aSeqRes  = [];
+    my $aAlnCols = [];
+
+    for (my $i=0; $i<$aln->getLength; $i++)
+    {
+        if (NO_FOCUS == $focus
+                or $aln->getResidueAt($focus, $i) ne CSequence::GAP_CHAR)
+        {
+            push @$aScores, $scorer->scorePos($i);
+            push @$aSeqRes, (NO_FOCUS == $focus)
+                            ? $NO_FOCUS_CHAR
+                            : $aln->getResidueAt($focus, $i);
+            push @$aAlnCols, $aln->getColumnResidues($i);
+        }
+    }
+    return $aScores, $aSeqRes, $aAlnCols;
+}
+
+sub SaveScores($$$$$)
+{
+    my($ostCons, $aScores, $aSeqRes, $aAlnCols) = @ARG;
+    
+    for (my $i=0; $i<@$aScores; $i++)
+    {
+        println($ostCons, sprintf('%-15.3f %-15.15s', $aScores->[$i],
+                $aSeqRes->[$i]).(join '',@{$aAlnCols->[$i]}));
+    }
+}
+
+sub ParseCommandLine()
+{
+    my %options = ();
+    my $correctArgList = GetOptions(
+                                \%options,
+                                 'h',
+                                 'dops=s',
+                                 'gapphilia=f',
+                                 'focus=i',
+                                 'frank',
+                                 'matrix=s',
+                                 'matrixfile=s',
+                                 'matrixnorm=s',
+                                 'method=s',
+                                 'o=s',
+                                 'trident_diversity=f',
+                                 'trident_chemistry=f',
+                                 'trident_gaps=f',
+                                );
+    
+    # check arguments
+    if (not $correctArgList
+            or $options{'h'}
+            or 1 != @ARGV)
+    {
+        Usage();
+        exit(1);
+    }
+
+    # read alignment
+    my($alnFile) = @ARGV;
+    my($aln, $focus) = LoadAln($alnFile, %options);
+
+    # set up scorer
+    my $scorer = InitScorer(%options);
+    
+    # init output
+    my $ostCons = ($options{'o'}) ? OpenFilesForWriting($options{'o'})
+                               : GetStdOut();
+
+    # other switches
+    $ostDops = OpenFilesForWriting($options{'dops'}) if $options{'dops'};
+    $isCalcFranks = true if $options{'frank'};
+    
+    return $aln, $focus, $scorer, $ostCons;
+}
+
+sub LoadAln
+{
+    my($alnFile, %options) = @ARG;
+    
+    # set format
+    my $reader = new CSequenceReader(OpenFilesForReading($alnFile),
+            CSequenceReader::FASTA_OR_PIR);
+    my $aln = new CAlignment($reader->getSeqs);
+    
+    # set focus
+    my $focus = NO_FOCUS;
+    if (defined $options{'focus'})
+    {
+        $focus = $options{'focus'};
+        if ($focus > $aln->getNumSeqs - 1
+                or $focus < 0)
+        {
+            Fatal("alignment does not contain sequence number $focus");
+        }
+    }
+    return $aln, $focus;
+}
+
+sub InitScorer
+{
+    my(%options) = @ARG;
+    
+    #--------------
+    # load matrix
+    #--------------
+    
+    my $matrix = 0;
+    if ($options{'matrixfile'})
+    {
+        $matrix = new CMdm(OpenFilesForReading($options{'matrixfile'}));
+    }
+    elsif ($options{'matrix'})
+    {
+        if (not exists $hMatrixFiles{$options{'matrix'}})
+        {
+            Fatal("unknown matrix: ".$options{'matrix'});
+        }
+        $matrix = new CMdm(OpenFilesForReading(
+                $hMatrixFiles{$options{'matrix'}}));
+    }
+    else
+    {
+        $matrix = new CMdm(OpenFilesForReading(
+                $hMatrixFiles{$DEFAULT_MATRIX}));
+    }
+    #-----------------
+    # normalize matrix
+    #-----------------
+    
+    # remove non-standard amino types
+    my $aOldSymbols = $matrix->getAxis;
+    my $aNewSymbols = [];
+    for my $symbol (@$aOldSymbols)
+    {
+        if ($symbol =~ m/[A-Z]/ && $symbol ne 'X')
+        {
+            push @$aNewSymbols, $symbol;
+        }
+    }
+    $matrix = $matrix->cloneOnly($aNewSymbols);
+        
+    my $matrixNorm = $options{'matrixnorm'} || $DEFAULT_MATRIX_NORM;
+    if ('linear' eq $matrixNorm)
+    {
+        $matrix = NormalizeMdm::LinearRange($matrix, 0, 1);
+    }
+    elsif ('karlinlike' eq $matrixNorm)
+    {
+        $matrix = NormalizeMdm::Karlin($matrix);
+        $matrix = NormalizeMdm::LinearRange($matrix, 0, 1);
+    }
+    else
+    {
+        Fatal("unrecognized normalization: $matrixNorm");
+    }
+
+    #-----------------------
+    # set up gap preferences
+    #-----------------------
+    
+    my $gapPhilia = (defined $options{'gapphilia'})
+                     ? $options{'gapphilia'}
+                     : $DEFAULT_GAP_PHILIA;
+                     
+    unless ($gapPhilia >= 0 and $gapPhilia <= 1)
+    {
+        println("gapphilia must be between 0 and 1");
+        Usage();
+        exit;
+    }
+    
+    # set gaps
+    $matrix->setTransition(CSequence::GAP_CHAR, CSequence::GAP_CHAR,
+            $gapPhilia);
+    $matrix->setTransitionXvsNotX(CSequence::GAP_CHAR, $gapPhilia);
+    # treat X's like gaps
+    $matrix->setTransition('X','X', $gapPhilia);
+    $matrix->setTransitionXvsNotX('X', $gapPhilia);
+    
+    #--------------
+    # set up scorer
+    #--------------
+    
+    my $scorer = undef;
+    my $method = $options{'method'} || $DEFAULT_METHOD;
+
+    # entropy-type scorers
+    if ('entropy' eq $method)
+    {
+        $scorer = new MsaCon::CEntropyScorer;
+    }
+    elsif ('entropynorm7' eq $method)
+    {
+        $scorer = new MsaCon::CEntropyNorm7Scorer;
+    }
+    elsif ('entropynorm21' eq $method)
+    {
+        $scorer = new MsaCon::CEntropyNorm21Scorer;
+    }
+    elsif ('basicmdm' eq $method)
+    {
+        $scorer = new MsaCon::CBasicMdmScorer($matrix);
+    }
+    elsif ('valdar01' eq $method)
+    {
+        $scorer = new MsaCon::CValdar01Scorer($matrix);
+    }
+    elsif ('trident' eq $method)
+    {
+        $scorer = new MsaCon::CTridentScorer($matrix);
+        
+        # set parameters
+        my $diversity = (defined $options{'trident_diversity'})
+                        ? $options{'trident_diversity'}
+                        : $DEFAULT_TRIDENT_DIVERSITY;
+        my $chemistry = (defined $options{'trident_chemistry'})
+                        ? $options{'trident_chemistry'}
+                        : $DEFAULT_TRIDENT_CHEMISTRY;
+        my $gaps = (defined $options{'trident_gaps'})
+                        ? $options{'trident_gaps'}
+                        : $DEFAULT_TRIDENT_GAPS;
+
+        $scorer->setDiversityExp($diversity);
+        $scorer->setChemistryExp($chemistry);
+        $scorer->setGapCostExp($gaps);
+    }
+    return $scorer;
+}
+
+sub Usage()
+{
+    print <<'EOU';
+
+syntax: scorecons alnFile [--dops filename] [--gapphilia real] [--focus int]
+                          [--frank] [--matrixfile filename] [--matrix name]
+                          [--matrixnorm string] [--method string] [-o filename]
+                          [--trident_diversity real] [--trident_chemistry real]
+                          [--trident_gaps real]
+
+http://www.biochem.ucl.ac.uk/bsm/valdarprograms/scorecons.html
+
+EOU
+}
